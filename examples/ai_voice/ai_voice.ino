@@ -27,13 +27,13 @@ constexpr gpio_num_t kTriggerPin = GPIO_NUM_34;
 constexpr gpio_num_t kLedPin = GPIO_NUM_2;
 
 #elif defined(ARDUINO_ESP32S3_DEV)
-constexpr gpio_num_t kMicPinBclk = GPIO_NUM_5;
-constexpr gpio_num_t kMicPinWs = GPIO_NUM_2;
-constexpr gpio_num_t kMicPinDin = GPIO_NUM_4;
+constexpr gpio_num_t kMicPinBclk = GPIO_NUM_13;
+constexpr gpio_num_t kMicPinWs = GPIO_NUM_11;
+constexpr gpio_num_t kMicPinDin = GPIO_NUM_12;
 
-constexpr gpio_num_t kSpeakerPinBclk = GPIO_NUM_13;
-constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_14;
-constexpr gpio_num_t kSpeakerPinDout = GPIO_NUM_1;
+constexpr gpio_num_t kSpeakerPinBclk = GPIO_NUM_40;
+constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_41;
+constexpr gpio_num_t kSpeakerPinDout = GPIO_NUM_42;
 
 constexpr gpio_num_t kTriggerPin = GPIO_NUM_0;
 constexpr gpio_num_t kLedPin = GPIO_NUM_6;

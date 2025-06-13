@@ -19,9 +19,11 @@
 #include <vector>
 
 #include "ai_vox_engine.h"
+#include "ai_vox_observer.h"
 #include "espressif_esp_websocket_client/esp_websocket_client.h"
 #include "iot/iot_manager.h"
 #include "messaging/message_queue.h"
+#include "task_queue/task_queue.h"
 
 struct button_dev_t;
 class AudioInputEngine;
@@ -42,12 +44,10 @@ class EngineImpl : public Engine {
   void Start(std::shared_ptr<AudioInputDevice> audio_input_device, std::shared_ptr<AudioOutputDevice> audio_output_device) override;
 
  private:
-  enum class State {
+  enum class State : uint8_t {
     kIdle,
     kInited,
-    kLoadingProtocol,
     kWebsocketConnecting,
-    kWebsocketConnected,
     kStandby,
     kListening,
     kSpeaking,
@@ -62,26 +62,24 @@ class EngineImpl : public Engine {
     kOnOutputDataComsumed,
   };
 
-  // using Message = Message<MessageType>;
-  // using MessageQueue = MessageQueue<MessageType>;
-
-  static void Loop(void *self);
   static void OnButtonClick(void *button_handle, void *usr_data);
   static void OnWebsocketEvent(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 
-  void Loop();
   void OnButtonClick();
   void OnWebsocketEvent(esp_event_base_t base, int32_t event_id, void *event_data);
-  void OnWebSocketEventData(const uint8_t op_code, std::shared_ptr<std::vector<uint8_t>> &&data);
   void OnJsonData(std::vector<uint8_t> &&data);
   void OnWebSocketConnected();
-  void OnAudioOutputDataConsumed();
+  void OnWebSocketDisconnected();
+  void OnAudioOutputDataConsumed(std::string &&task_id, std::string &&session_id, std::string &&session_status);
+  void OnAudioFrameBegin(std::vector<uint8_t> &&code);
+  void OnAudioFrame(std::vector<uint8_t> &&data);
+  void OnAudioFrameEnd();
+  void OnTriggered();
 
   void LoadProtocol();
+  void BindDevice();
   void StartListening();
-  void AbortSpeaking();
-  bool ConnectWebSocket();
-  void DisconnectWebSocket();
+  void ConnectWebSocket();
   void SendIotDescriptions();
   void SendIotUpdatedStates(const bool force);
   void ChangeState(const State new_state);
@@ -89,6 +87,7 @@ class EngineImpl : public Engine {
   mutable std::mutex mutex_;
   MessageQueue<MessageType> message_queue_;
   State state_ = State::kIdle;
+  ChatState chat_state_ = ChatState::kIdle;
   button_dev_t *button_handle_ = nullptr;
   gpio_num_t trigger_pin_ = GPIO_NUM_0;
   std::vector<uint8_t> recving_websocket_data_;
@@ -97,13 +96,16 @@ class EngineImpl : public Engine {
   std::shared_ptr<Observer> observer_;
   ai_vox::iot::Manager iot_manager_;
   esp_websocket_client_handle_t web_socket_client_ = nullptr;
-  std::string uuid_;
-  std::string session_id_;
   std::shared_ptr<AudioInputEngine> audio_input_engine_;
   std::shared_ptr<AudioOutputEngine> audio_output_engine_;
   std::string ota_url_;
   std::string websocket_url_;
   std::map<std::string, std::string> websocket_headers_;
+  TaskQueue main_task_queue_;
+  std::unique_ptr<TaskQueue> transmit_task_queue_;
+  std::string tts_task_id_;
+  std::string tts_session_id_;
+  std::string tts_session_status_;
 };
 }  // namespace ai_vox
 

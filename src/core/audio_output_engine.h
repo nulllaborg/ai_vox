@@ -11,50 +11,23 @@
 #include <thread>
 #include <vector>
 
-#include "../audio_output_device.h"
-#include "messaging/message.h"
-#include "messaging/message_queue.h"
+#include "audio_output_device.h"
+#include "espressif_esp_audio_codec/esp_audio_simple_dec.h"
+#include "task_queue/task_queue.h"
 
 class OpusDecoder;
 class AudioOutputEngine {
  public:
-  enum class Event : uint8_t {
-    kOnDataComsumed = 1 << 0,
-  };
-
-  using EventHandler = std::function<void(Event)>;
-
-  AudioOutputEngine(const EventHandler& handler);
+  AudioOutputEngine(std::shared_ptr<ai_vox::AudioOutputDevice> audio_output_device);
   ~AudioOutputEngine();
 
-  void Open(std::shared_ptr<ai_vox::AudioOutputDevice> audio_output_device);
-  void Close();
   void Write(std::vector<uint8_t>&& data);
-  void NotifyDataEnd();
+  void NotifyDataEnd(std::function<void()>&& callback);
 
  private:
-  enum class State : uint8_t {
-    kIdle,
-    kRunning,
-  };
+  void ProcessData(std::vector<uint8_t>&& data);
 
-  enum class MessageType : uint8_t {
-    kOpen,
-    kClose,
-    kData,
-    kDataEnd,
-  };
-
-  // using Message = Message<MessageType>;
-  // using MessageQueue = MessageQueue<MessageType>;
-
-  static void Loop(void* self);
-  void Loop();
-
-  std::mutex mutex_;
-  State state_ = State::kIdle;
-  struct OpusDecoder* opus_decoder_ = nullptr;
-  uint32_t frame_size_ = 0;
-  EventHandler handler_;
-  MessageQueue<MessageType> message_queue_;
+  esp_audio_simple_dec_handle_t audio_dec_handle_;
+  std::shared_ptr<ai_vox::AudioOutputDevice> audio_output_device_;
+  TaskQueue* task_queue_ = nullptr;
 };

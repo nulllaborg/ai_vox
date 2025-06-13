@@ -12,6 +12,7 @@
 #include <cJSON.h>
 #include <driver/i2c_master.h>
 #include <esp_crt_bundle.h>
+#include <esp_http_client.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -35,6 +36,8 @@ namespace ai_vox {
 
 namespace {
 
+constexpr size_t kAudioFrameBeginCodeSize = 6;
+
 enum WebScoketFrameType : uint8_t {
   kWebsocketTextFrame = 0x01,    // 文本帧
   kWebsocketBinaryFrame = 0x02,  // 二进制帧
@@ -51,41 +54,6 @@ std::string GetMacAddress() {
   return std::string(mac_str);
 }
 
-std::string Uuid() {
-  // UUID v4 需要 16 字节的随机数据
-  uint8_t uuid[16];
-
-  // 使用 ESP32 的硬件随机数生成器
-  esp_fill_random(uuid, sizeof(uuid));
-
-  // 设置版本 (版本 4) 和变体位
-  uuid[6] = (uuid[6] & 0x0F) | 0x40;  // 版本 4
-  uuid[8] = (uuid[8] & 0x3F) | 0x80;  // 变体 1
-
-  // 将字节转换为标准的 UUID 字符串格式
-  char uuid_str[37];
-  snprintf(uuid_str,
-           sizeof(uuid_str),
-           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-           uuid[0],
-           uuid[1],
-           uuid[2],
-           uuid[3],
-           uuid[4],
-           uuid[5],
-           uuid[6],
-           uuid[7],
-           uuid[8],
-           uuid[9],
-           uuid[10],
-           uuid[11],
-           uuid[12],
-           uuid[13],
-           uuid[14],
-           uuid[15]);
-
-  return std::string(uuid_str);
-}
 }  // namespace
 
 EngineImpl &EngineImpl::GetInstance() {
@@ -96,12 +64,12 @@ EngineImpl &EngineImpl::GetInstance() {
 }
 
 EngineImpl::EngineImpl()
-    : uuid_(Uuid()),
-      ota_url_("https://api.tenclass.net/xiaozhi/ota/"),
+    : ota_url_("https://api.tenclass.net/xiaozhi/ota/"),
       websocket_url_("wss://api.tenclass.net/xiaozhi/v1/"),
       websocket_headers_{
           {"Authorization", "Bearer test-token"},
-      } {
+      },
+      main_task_queue_("AiVoxMain", 1024 * 4, tskIDLE_PRIORITY + 1) {
   CLOGD();
 }
 
@@ -182,15 +150,8 @@ void EngineImpl::Start(std::shared_ptr<AudioInputDevice> audio_input_device, std
   ESP_ERROR_CHECK(iot_button_register_cb(button_handle_, BUTTON_SINGLE_CLICK, nullptr, OnButtonClick, this));
 
   ChangeState(State::kInited);
-  LoadProtocol();
-
-  auto ret = xTaskCreate(Loop, "AiVoxMain", 1024 * 4, this, tskIDLE_PRIORITY + 1, nullptr);
-  assert(ret == pdPASS);
-}
-
-void EngineImpl::Loop(void *self) {
-  reinterpret_cast<EngineImpl *>(self)->Loop();
-  vTaskDelete(nullptr);
+  BindDevice();
+  main_task_queue_.Enqueue(std::bind(&EngineImpl::ConnectWebSocket, this));
 }
 
 void EngineImpl::OnButtonClick(void *button_handle, void *self) {
@@ -201,90 +162,8 @@ void EngineImpl::OnWebsocketEvent(void *self, esp_event_base_t base, int32_t eve
   reinterpret_cast<EngineImpl *>(self)->OnWebsocketEvent(base, event_id, event_data);
 }
 
-void EngineImpl::Loop() {
-loop_start:
-  auto message = message_queue_.Recevie();
-  if (!message.has_value()) {
-    goto loop_start;
-  }
-  switch (message->type()) {
-    case MessageType::kOnButtonClick: {
-      CLOGD("kOnButtonClick");
-      switch (state_) {
-        case State::kInited: {
-          LoadProtocol();
-          break;
-        }
-        case State::kStandby: {
-          ConnectWebSocket();
-          break;
-        }
-        case State::kListening: {
-          DisconnectWebSocket();
-          break;
-        }
-        case State::kSpeaking: {
-          AbortSpeaking();
-          break;
-        }
-        default: {
-          break;
-        }
-      }
-      break;
-    }
-
-    case MessageType::kOnOutputDataComsumed: {
-      CLOGD("kOnOutputDataComsumed");
-      OnAudioOutputDataConsumed();
-      break;
-    }
-    case MessageType::kOnWebsocketConnected: {
-      CLOGD("kOnWebsocketConnected");
-      OnWebSocketConnected();
-      break;
-    }
-    case MessageType::kOnWebsocketDisconnected: {
-      CLOGD("kOnWebsocketDisconnected");
-      audio_input_engine_.reset();
-      audio_output_engine_.reset();
-      if (web_socket_client_ != nullptr) {
-        esp_websocket_client_close(web_socket_client_, pdMS_TO_TICKS(5000));
-        esp_websocket_client_destroy(web_socket_client_);
-        web_socket_client_ = nullptr;
-      }
-      ChangeState(State::kInited);
-      break;
-    }
-    case MessageType::kOnWebsocketEventData: {
-      auto op_code = message->Read<uint8_t>();
-      auto data = message->Read<std::shared_ptr<std::vector<uint8_t>>>();
-      if (op_code && data) {
-        OnWebSocketEventData(*op_code, std::move(*data));
-      }
-      break;
-    }
-    case MessageType::kOnWebsocketFinish: {
-      CLOG("kOnWebsocketFinish");
-      audio_input_engine_.reset();
-      audio_output_engine_.reset();
-      if (web_socket_client_ != nullptr) {
-        esp_websocket_client_close(web_socket_client_, pdMS_TO_TICKS(5000));
-        esp_websocket_client_destroy(web_socket_client_);
-        web_socket_client_ = nullptr;
-      }
-      ChangeState(State::kStandby);
-      break;
-    }
-    default: {
-      break;
-    }
-  }
-  goto loop_start;
-}
-
 void EngineImpl::OnButtonClick() {
-  message_queue_.Send(MessageType::kOnButtonClick);
+  main_task_queue_.Enqueue(std::bind(&EngineImpl::OnTriggered, this));
 }
 
 void EngineImpl::OnWebsocketEvent(esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -296,31 +175,57 @@ void EngineImpl::OnWebsocketEvent(esp_event_base_t base, int32_t event_id, void 
     }
     case WEBSOCKET_EVENT_CONNECTED: {
       CLOGI("WEBSOCKET_EVENT_CONNECTED");
-      message_queue_.Send(MessageType::kOnWebsocketConnected);
+      main_task_queue_.Enqueue(std::bind(&EngineImpl::OnWebSocketConnected, this));
       break;
     }
     case WEBSOCKET_EVENT_DISCONNECTED: {
       CLOGI("WEBSOCKET_EVENT_DISCONNECTED");
-      message_queue_.Send(MessageType::kOnWebsocketDisconnected);
+      main_task_queue_.Enqueue(std::bind(&EngineImpl::OnWebSocketDisconnected, this));
       break;
     }
     case WEBSOCKET_EVENT_DATA: {
-      if (data->fin) {
-        if (recving_websocket_data_.empty()) {
-          Message message(MessageType::kOnWebsocketEventData);
-          message.Write(data->op_code);
-          message.Write(std::make_shared<std::vector<uint8_t>>(data->data_ptr, data->data_ptr + data->data_len));
-          message_queue_.Send(std::move(message));
-        } else {
-          recving_websocket_data_.insert(recving_websocket_data_.end(), data->data_ptr, data->data_ptr + data->data_len);
-          Message message(MessageType::kOnWebsocketEventData);
-          message.Write(data->op_code);
-          message.Write(std::make_shared<std::vector<uint8_t>>(std::move(recving_websocket_data_)));
-          message_queue_.Send(std::move(message));
-          recving_websocket_data_.clear();
+      // CLOGI("total length: %d, payload offset: %d, payload length: %d, op_code: %u",
+      //       data->payload_len,
+      //       data->payload_offset,
+      //       data->data_len,
+      //       data->op_code);
+      switch (data->op_code) {
+        case kWebsocketTextFrame: {
+          std::vector<uint8_t> text(data->data_len);
+          memcpy(text.data(), data->data_ptr, data->data_len);
+          main_task_queue_.Enqueue([this, json_data = std::move(text)]() mutable { OnJsonData(std::move(json_data)); });
+          break;
         }
-      } else {
-        recving_websocket_data_.insert(recving_websocket_data_.end(), data->data_ptr, data->data_ptr + data->data_len);
+        case kWebsocketBinaryFrame: {
+          if (data->data_len < kAudioFrameBeginCodeSize) {
+            CLOGE("Invalid binary frame data length: %d", data->data_len);
+            return;
+          }
+
+          auto data_length = data->data_len;
+          auto data_ptr = data->data_ptr;
+          if (data->payload_offset == 0) {
+            std::vector<uint8_t> code(kAudioFrameBeginCodeSize);
+            memcpy(code.data(), data_ptr, kAudioFrameBeginCodeSize);
+            main_task_queue_.Enqueue([this, code = std::move(code)]() mutable { OnAudioFrameBegin(std::move(code)); });
+            data_ptr += kAudioFrameBeginCodeSize;
+            data_length -= kAudioFrameBeginCodeSize;
+          }
+
+          if (data_length > 0) {
+            std::vector<uint8_t> audio_frame(data_length);
+            memcpy(audio_frame.data(), data_ptr, data_length);
+            main_task_queue_.Enqueue([this, audio_frame = std::move(audio_frame)]() mutable { OnAudioFrame(std::move(audio_frame)); });
+          }
+
+          if (data->payload_len == data->payload_offset + data->data_len) {
+            main_task_queue_.Enqueue([this]() { OnAudioFrameEnd(); });
+          }
+          break;
+        }
+        default: {
+          break;
+        }
       }
       break;
     }
@@ -330,7 +235,6 @@ void EngineImpl::OnWebsocketEvent(esp_event_base_t base, int32_t event_id, void 
     }
     case WEBSOCKET_EVENT_FINISH: {
       CLOGI("WEBSOCKET_EVENT_FINISH");
-      message_queue_.Send(MessageType::kOnWebsocketFinish);
       break;
     }
     default: {
@@ -339,26 +243,79 @@ void EngineImpl::OnWebsocketEvent(esp_event_base_t base, int32_t event_id, void 
   }
 }
 
-void EngineImpl::OnWebSocketEventData(const uint8_t op_code, std::shared_ptr<std::vector<uint8_t>> &&data) {
-  switch (op_code) {
-    case kWebsocketTextFrame: {
-      CLOGI("%.*s", static_cast<int>(data->size()), data->data());
-      OnJsonData(std::move(*data));
-      break;
-    }
-    case kWebsocketBinaryFrame: {
-      if (audio_output_engine_) {
-        audio_output_engine_->Write(std::move(*data));
+void EngineImpl::OnJsonData(std::vector<uint8_t> &&data) {
+  CLOGI("OnJsonData: %.*s", static_cast<int>(data.size()), data.data());
+  const auto root_json = cJSON_ParseWithLength(reinterpret_cast<const char *>(data.data()), data.size());
+  if (!cJSON_IsObject(root_json)) {
+    CLOGE("Invalid JSON data");
+    cJSON_Delete(root_json);
+    return;
+  }
+
+  std::string type;
+  auto *type_json = cJSON_GetObjectItem(root_json, "type");
+  if (cJSON_IsString(type_json)) {
+    type = type_json->valuestring;
+  } else {
+    CLOGE("Missing or invalid 'type' field in JSON data");
+    cJSON_Delete(root_json);
+    return;
+  }
+
+  if (type == "play_audio") {
+    auto *tts_task_id_json = cJSON_GetObjectItem(root_json, "tts_task_id");
+    if (cJSON_IsString(tts_task_id_json)) {
+      tts_task_id_ = tts_task_id_json->valuestring;
+      CLOGI("TTS Task ID: %s", tts_task_id_.c_str());
+      audio_input_engine_.reset();
+      transmit_task_queue_.reset();
+      if (!audio_output_engine_) {
+        audio_output_engine_ = std::make_shared<AudioOutputEngine>(audio_output_device_);
       }
-      break;
+      ChangeState(State::kSpeaking);
+    } else {
+      CLOGE("Missing or invalid 'tts_task_id' field in JSON data");
+      cJSON_Delete(root_json);
+      return;
     }
-    default: {
-      CLOGI("Unsupported WebSocket frame type: %u", op_code);
-      break;
+  } else if (type == "instruct") {
+    const auto *command_id_json = cJSON_GetObjectItem(root_json, "command_id");
+    std::string command_id;
+    if (cJSON_IsString(command_id_json)) {
+      command_id = command_id_json->valuestring;
+    } else {
+      CLOGE("Missing or invalid 'command_id' field in JSON data");
+      cJSON_Delete(root_json);
+      return;
+    }
+
+    if (command_id == "on_iat_cb") {
+      const auto *data_json = cJSON_GetObjectItem(root_json, "data");
+      if (cJSON_IsString(data_json)) {
+        std::string message(data_json->valuestring);
+        if (observer_ && !message.empty()) {
+          observer_->PushEvent(Observer::ChatMessageEvent{ChatRole::kUser, std::move(message)});
+        }
+      } else {
+        CLOGE("Missing or invalid 'data' field in JSON data");
+      }
+    } else if (command_id == "on_llm_cb") {
+      const auto *data_json = cJSON_GetObjectItem(root_json, "data");
+      if (cJSON_IsString(data_json)) {
+        std::string message(data_json->valuestring);
+        if (observer_ && !message.empty()) {
+          observer_->PushEvent(Observer::ChatMessageEvent{ChatRole::kAssistant, std::move(message)});
+        }
+      } else {
+        CLOGE("Missing or invalid 'data' field in JSON data");
+      }
     }
   }
+
+  cJSON_Delete(root_json);
 }
 
+#if 0
 void EngineImpl::OnJsonData(std::vector<uint8_t> &&data) {
   const auto root_json = cJSON_ParseWithLength(reinterpret_cast<const char *>(data.data()), data.size());
   if (!cJSON_IsObject(root_json)) {
@@ -414,13 +371,13 @@ void EngineImpl::OnJsonData(std::vector<uint8_t> &&data) {
           return;
         }
         audio_input_engine_.reset();
-        audio_output_engine_ = std::make_shared<AudioOutputEngine>([this](AudioOutputEngine::Event event) {
+        audio_output_engine_ = std::make_shared<AudioOutputEngine>(audio_output_device_, [this](AudioOutputEngine::Event event) {
           if (event == AudioOutputEngine::Event::kOnDataComsumed) {
             CLOGD("kOnDataComsumed");
             message_queue_.Send(MessageType::kOnOutputDataComsumed);
           }
         });
-        audio_output_engine_->Open(audio_output_device_);
+        // audio_output_engine_->Open(audio_output_device_);
         ChangeState(State::kSpeaking);
       } else if (strcmp("stop", state_json->valuestring) == 0) {
         CLOG("tts stop");
@@ -500,95 +457,90 @@ void EngineImpl::OnJsonData(std::vector<uint8_t> &&data) {
   }
   cJSON_Delete(root_json);
 }
+#endif
 
 void EngineImpl::OnWebSocketConnected() {
   CLOGI();
-  if (state_ != State::kWebsocketConnecting) {
-    CLOG("invalid state: %u", state_);
-    return;
-  }
-  ChangeState(State::kWebsocketConnected);
+  auto const root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "type", "play_audio_ws_conntceed");
 
-  auto const message = cJSON_CreateObject();
-  cJSON_AddStringToObject(message, "type", "hello");
-  cJSON_AddNumberToObject(message, "version", 1);
-  cJSON_AddStringToObject(message, "transport", "websocket");
-
-  auto const audio_params = cJSON_CreateObject();
-  cJSON_AddStringToObject(audio_params, "format", "opus");
-  cJSON_AddNumberToObject(audio_params, "sample_rate", 16000);
-  cJSON_AddNumberToObject(audio_params, "channels", 1);
-  cJSON_AddNumberToObject(audio_params, "frame_duration", 20);
-  cJSON_AddItemToObject(message, "audio_params", audio_params);
-
-  const auto text = cJSON_PrintUnformatted(message);
+  const auto text = cJSON_PrintUnformatted(root);
   const auto length = strlen(text);
   CLOGI("sending text: %.*s", static_cast<int>(length), text);
-  esp_websocket_client_send_text(web_socket_client_, text, length, pdMS_TO_TICKS(5000));
+  const auto ret = esp_websocket_client_send_text(web_socket_client_, text, length, pdMS_TO_TICKS(5000));
   cJSON_free(text);
-  cJSON_Delete(message);
+  cJSON_Delete(root);
+  if (ret != length) {
+    CLOGE("Failed to send text, ret: %d, expected: %d", ret, length);
+  }
 }
 
-void EngineImpl::OnAudioOutputDataConsumed() {
+void EngineImpl::OnWebSocketDisconnected() {
   CLOGI();
-  if (state_ != State::kSpeaking) {
-    CLOG("invalid state: %u", state_);
-    return;
-  }
-  SendIotUpdatedStates(false);
-  StartListening();
+  audio_input_engine_.reset();
+  transmit_task_queue_.reset();
+  audio_output_engine_.reset();
 }
 
-void EngineImpl::LoadProtocol() {
+void EngineImpl::OnAudioFrameBegin(std::vector<uint8_t> &&code) {
+  CLOGI("code size: %zu", code.size());
+  tts_session_id_ = std::string(code.data(), code.data() + 4);
+  tts_session_status_ = std::string(code.data() + 4, code.data() + 6);
+  CLOGI("session_id: %s, session_status: %s", tts_session_id_.c_str(), tts_session_status_.c_str());
+}
+
+void EngineImpl::OnAudioFrame(std::vector<uint8_t> &&audio_frame) {
+  if (audio_output_engine_ == nullptr) {
+    return;
+  }
+  audio_output_engine_->Write(std::move(audio_frame));
+}
+
+void EngineImpl::OnAudioFrameEnd() {
+  if (audio_output_engine_ == nullptr) {
+    return;
+  }
+
+  if (tts_session_status_ == "03" || tts_session_status_ == "02") {
+    audio_output_engine_->NotifyDataEnd([this,
+                                         task_id = std::move(tts_task_id_),
+                                         session_id = std::move(tts_session_id_),
+                                         session_status = std::move(tts_session_status_)]() mutable {
+      main_task_queue_.Enqueue(
+          [this, task_id = std::move(task_id), session_id = std::move(session_id), session_status = std::move(session_status)]() mutable {
+            OnAudioOutputDataConsumed(std::move(task_id), std::move(session_id), std::move(session_status));
+          });
+    });
+  }
+}
+
+void EngineImpl::OnTriggered() {
   CLOGI();
-  if (state_ != State::kInited) {
-    CLOG("invalid state: %u", state_);
-    return;
-  }
 
-  ChangeState(State::kLoadingProtocol);
-
-  auto config = GetConfigFromServer(ota_url_, uuid_);
-
-  if (!config.has_value()) {
-    CLOGE("GetConfigFromServer failed");
-    ChangeState(State::kInited);
-    return;
-  }
-
-  CLOG("mqtt endpoint: %s", config->mqtt.endpoint.c_str());
-  CLOG("mqtt client_id: %s", config->mqtt.client_id.c_str());
-  CLOG("mqtt username: %s", config->mqtt.username.c_str());
-  CLOG("mqtt password: %s", config->mqtt.password.c_str());
-  CLOG("mqtt publish_topic: %s", config->mqtt.publish_topic.c_str());
-  CLOG("mqtt subscribe_topic: %s", config->mqtt.subscribe_topic.c_str());
-
-  CLOG("activation code: %s", config->activation.code.c_str());
-  CLOG("activation message: %s", config->activation.message.c_str());
-
-  if (!config->activation.code.empty()) {
-    if (observer_) {
-      observer_->PushEvent(Observer::ActivationEvent{config->activation.code, config->activation.message});
+  switch (state_) {
+    case State::kStandby:
+    case State::kSpeaking: {
+      StartListening();
+      break;
     }
-    ChangeState(State::kInited);
-    return;
-  }
+    case State::kListening: {
+      break;
+    }
 
-  ChangeState(State::kStandby);
-  return;
+    default: {
+      break;
+    }
+  }
 }
 
-void EngineImpl::StartListening() {
-  if (state_ != State::kWebsocketConnected && state_ != State::kSpeaking) {
-    CLOG("invalid state: %u", state_);
-    return;
-  }
-
+void EngineImpl::OnAudioOutputDataConsumed(std::string &&task_id, std::string &&session_id, std::string &&session_status) {
+  CLOGI("OnAudioOutputDataConsumed: task_id: %s", task_id.c_str());
   auto root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "session_id", session_id_.c_str());
-  cJSON_AddStringToObject(root, "type", "listen");
-  cJSON_AddStringToObject(root, "state", "start");
-  cJSON_AddStringToObject(root, "mode", "auto");
+  cJSON_AddStringToObject(root, "type", "client_out_audio_over");
+  cJSON_AddStringToObject(root, "session_id", session_id.c_str());
+  cJSON_AddStringToObject(root, "session_status", session_status.c_str());
+  cJSON_AddStringToObject(root, "tts_task_id", task_id.c_str());
+
   const auto text = cJSON_PrintUnformatted(root);
   const auto length = strlen(text);
   CLOGI("sending text: %.*s", static_cast<int>(length), text);
@@ -596,79 +548,127 @@ void EngineImpl::StartListening() {
   cJSON_free(text);
   cJSON_Delete(root);
 
-  audio_output_engine_.reset();
-  audio_input_engine_ = std::make_shared<AudioInputEngine>(audio_input_device_, [this](std::vector<uint8_t> &&data) {
-    esp_websocket_client_send_bin(web_socket_client_, reinterpret_cast<const char *>(data.data()), data.size(), portMAX_DELAY);
-  });
-  ChangeState(State::kListening);
+  if (session_status == "03" && (session_id == "0001" || session_id == "0010")) {
+    ChangeState(State::kStandby);
+    audio_output_engine_.reset();
+  } else if (session_status == "02") {
+    StartListening();
+  }
 }
 
-void EngineImpl::AbortSpeaking() {
-  if (state_ != State::kSpeaking) {
-    CLOGE("invalid state: %d", state_);
+void EngineImpl::BindDevice() {
+  esp_http_client_config_t http_client_config;
+  memset(&http_client_config, 0, sizeof(http_client_config));
+  http_client_config.url = "http://api.espai2.fun/devices/add";
+
+  auto client = esp_http_client_init(&http_client_config);
+  if (client == nullptr) {
+    CLOGE("esp_http_client_init failed.");
+    return;
+  }
+  esp_http_client_set_method(client, HTTP_METHOD_POST);
+  esp_http_client_set_header(client, "Content-Type", "application/json");
+
+  auto root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "version", "1.0.0");
+  cJSON_AddStringToObject(root, "bin_id", "0");
+  cJSON_AddStringToObject(root, "device_id", GetMacAddress().c_str());
+  cJSON_AddStringToObject(root, "api_key", "f056f7d2494e4ca8be0851a2fcecfd50");
+  cJSON_AddStringToObject(root, "wifi_ssid", "none");
+  cJSON_AddStringToObject(root, "wifi_pwd", "none");
+  const auto text = cJSON_PrintUnformatted(root);
+  const auto length = strlen(text);
+
+  auto err = esp_http_client_open(client, length);
+  if (err != ESP_OK) {
+    CLOGE("esp_http_client_open failed. Error: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    cJSON_free(text);
+    cJSON_Delete(root);
     return;
   }
 
-  auto const message = cJSON_CreateObject();
-  cJSON_AddStringToObject(message, "session_id", session_id_.c_str());
-  cJSON_AddStringToObject(message, "type", "abort");
-  const auto text = cJSON_PrintUnformatted(message);
+  auto wlen = esp_http_client_write(client, text, length);
+  if (wlen < 0) {
+    CLOGE("esp_http_client_write failed.");
+    esp_http_client_cleanup(client);
+    cJSON_free(text);
+    cJSON_Delete(root);
+    return;
+  }
+
+  auto content_length = esp_http_client_fetch_headers(client);
+  if (content_length < 0) {
+    CLOGE("esp_http_client_fetch_headers failed.");
+    esp_http_client_cleanup(client);
+    cJSON_free(text);
+    cJSON_Delete(root);
+    return;
+  }
+
+  std::vector<char> response(content_length + 1);
+  response[content_length] = '\0';
+  esp_http_client_read_response(client, response.data(), content_length);
+  esp_http_client_cleanup(client);
+  cJSON_free(text);
+  cJSON_Delete(root);
+
+  CLOG("response:%s", response.data());
+}
+
+void EngineImpl::StartListening() {
+  CLOGI();
+  ChangeState(State::kListening);
+  auto root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "type", "start");
+  const auto text = cJSON_PrintUnformatted(root);
   const auto length = strlen(text);
   CLOGI("sending text: %.*s", static_cast<int>(length), text);
   esp_websocket_client_send_text(web_socket_client_, text, length, pdMS_TO_TICKS(5000));
   cJSON_free(text);
-  cJSON_Delete(message);
-  CLOG("OK");
+  cJSON_Delete(root);
+
+  audio_input_engine_.reset();
+  audio_output_engine_.reset();
+  transmit_task_queue_ = std::make_unique<TaskQueue>("AiVoxTransmit", 1024 * 3, tskIDLE_PRIORITY + 1);
+  auto handler = [this](std::vector<int16_t> &&data) {
+    transmit_task_queue_->Enqueue([this, data = std::move(data)]() mutable {
+      const auto start_time = esp_timer_get_time();
+      esp_websocket_client_send_bin(
+          web_socket_client_, reinterpret_cast<const char *>(data.data()), data.size() * sizeof(data[0]), pdMS_TO_TICKS(3000));
+      CLOGI("send audio data size: %zu, time: %lld ms", data.size() * sizeof(data[0]), (esp_timer_get_time() - start_time) / 1000);
+    });
+  };
+  audio_input_engine_ = std::make_shared<AudioInputEngine>(audio_input_device_, std::move(handler));
 }
 
-bool EngineImpl::ConnectWebSocket() {
-  if (state_ != State::kStandby) {
-    CLOGE("invalid state: %u", state_);
-    return false;
-  }
+void EngineImpl::ConnectWebSocket() {
+  ChangeState(State::kWebsocketConnecting);
 
+  std::string path = std::string("/?v=2.84.43&device_id=") + GetMacAddress() + "&api_key=f056f7d2494e4ca8be0851a2fcecfd50";
+  CLOGI("path:%s", path.c_str());
+  esp_websocket_client_config_t websocket_cfg;
+  memset(&websocket_cfg, 0, sizeof(websocket_cfg));
+  websocket_cfg.host = "node.espai.fun";
+  websocket_cfg.port = 80;
+  websocket_cfg.path = path.c_str();
+  websocket_cfg.task_prio = tskIDLE_PRIORITY;
+  websocket_cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;
+  websocket_cfg.buffer_size = 1024 * 4;
+  websocket_cfg.reconnect_timeout_ms = 3000;
   if (web_socket_client_ != nullptr) {
     esp_websocket_client_stop(web_socket_client_);
     esp_websocket_client_destroy(web_socket_client_);
   }
-
-  esp_websocket_client_config_t websocket_cfg;
-  memset(&websocket_cfg, 0, sizeof(websocket_cfg));
-  websocket_cfg.uri = websocket_url_.c_str();
-  websocket_cfg.task_prio = tskIDLE_PRIORITY;
-  websocket_cfg.crt_bundle_attach = esp_crt_bundle_attach;
-
-  CLOGI("url: %s", websocket_cfg.uri);
   web_socket_client_ = esp_websocket_client_init(&websocket_cfg);
   CLOGI("web_socket_client_:%p", web_socket_client_);
-  if (web_socket_client_ == nullptr) {
-    CLOGE("esp_websocket_client_init failed with %s", websocket_cfg.uri);
-    return false;
-  }
-
-  for (const auto &[key, value] : websocket_headers_) {
-    esp_websocket_client_append_header(web_socket_client_, key.c_str(), value.c_str());
-  }
-  esp_websocket_client_append_header(web_socket_client_, "Protocol-Version", "1");
-  esp_websocket_client_append_header(web_socket_client_, "Device-Id", GetMacAddress().c_str());
-  esp_websocket_client_append_header(web_socket_client_, "Client-Id", uuid_.c_str());
   esp_websocket_register_events(web_socket_client_, WEBSOCKET_EVENT_ANY, &EngineImpl::OnWebsocketEvent, this);
-  CLOGI("esp_websocket_client_start");
-  esp_websocket_client_start(web_socket_client_);
-  ChangeState(State::kWebsocketConnecting);
-  CLOGI("websocket client start");
-  return true;
-}
-
-void EngineImpl::DisconnectWebSocket() {
-  if (web_socket_client_ == nullptr) {
+  const auto ret = esp_websocket_client_start(web_socket_client_);
+  CLOGI("esp_websocket_client_start ret: %d", ret);
+  if (ret != ESP_OK) {
+    CLOGE("esp_websocket_client_start failed with %d", ret);
     abort();
   }
-
-  audio_input_engine_.reset();
-  audio_output_engine_.reset();
-
-  esp_websocket_client_close(web_socket_client_, pdMS_TO_TICKS(5000));
 }
 
 void EngineImpl::SendIotDescriptions() {
@@ -699,18 +699,16 @@ void EngineImpl::SendIotUpdatedStates(const bool force) {
 }
 
 void EngineImpl::ChangeState(const State new_state) {
-  auto convert_state = [](const State state) {
+  state_ = new_state;
+
+  const auto convert_state = [](const State state) {
     switch (state) {
       case State::kIdle:
         return ChatState::kIdle;
       case State::kInited:
-        return ChatState::kIniting;
-      case State::kLoadingProtocol:
-        return ChatState::kIniting;
+        return ChatState::kIdle;
       case State::kWebsocketConnecting:
-        return ChatState::kConnecting;
-      case State::kWebsocketConnected:
-        return ChatState::kConnecting;
+        return ChatState::kIniting;
       case State::kStandby:
         return ChatState::kStandby;
       case State::kListening:
@@ -722,10 +720,12 @@ void EngineImpl::ChangeState(const State new_state) {
     }
   };
 
-  if (observer_) {
-    observer_->PushEvent(Observer::StateChangedEvent{convert_state(state_), convert_state(new_state)});
+  const auto new_chat_state = convert_state(new_state);
+
+  if (observer_ && new_chat_state != chat_state_) {
+    observer_->PushEvent(Observer::StateChangedEvent{chat_state_, new_chat_state});
   }
-  state_ = new_state;
+  chat_state_ = new_chat_state;
 }
 
 }  // namespace ai_vox

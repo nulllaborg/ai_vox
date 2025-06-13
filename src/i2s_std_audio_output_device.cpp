@@ -95,4 +95,29 @@ size_t I2sStdAudioOutputDevice::Write(std::vector<int16_t>&& pcm) {
   return buffer.size();
 }
 
+size_t I2sStdAudioOutputDevice::Write(const uint8_t* data, const size_t length) {
+  auto* pcm = reinterpret_cast<const int16_t*>(data);
+  if (length % sizeof(int16_t) != 0) {
+    printf("Invalid length: %zu\n", length);
+    return 0;
+  }
+  size_t samples = length / sizeof(int16_t);
+  std::vector<int32_t> buffer(samples);
+
+  for (size_t i = 0; i < samples; i++) {
+    int64_t temp = int64_t(pcm[i]) * volume_factor_;
+    if (temp > INT32_MAX) {
+      buffer[i] = INT32_MAX;
+    } else if (temp < INT32_MIN) {
+      buffer[i] = INT32_MIN;
+    } else {
+      buffer[i] = static_cast<int32_t>(temp);
+    }
+  }
+
+  size_t bytes_written = 0;
+  ESP_ERROR_CHECK(i2s_channel_write(i2s_tx_handle_, buffer.data(), buffer.size() * sizeof(int32_t), &bytes_written, 1000));
+  return buffer.size();
+}
+
 }  // namespace ai_vox
