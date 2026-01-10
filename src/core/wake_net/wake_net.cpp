@@ -1,3 +1,5 @@
+#define WAKE_NET_MODEL "27"
+
 #ifdef ARDUINO_ESP32S3_DEV
 
 #include "wake_net.h"
@@ -21,7 +23,7 @@ namespace {
 auto &g_afe_handle = ESP_AFE_SR_HANDLE;
 
 constexpr uint8_t kSrmodels[] = {
-#include "srmodels.bin"
+#include "models/wn9_nihaoxiaozhi_tts_arduino.bin"
 };
 
 constexpr uint32_t kSampleRate = 16000;
